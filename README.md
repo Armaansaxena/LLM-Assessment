@@ -81,6 +81,8 @@ The base model almost never produced the exact schema (0% exact match; titles on
 
 ## 15 test questions with source passages (`task2-rag/questions.json`)
 
+"Printed page" is the page number printed on the PDF page; the notebook's chunk pages are PDF page numbers, which are printed page + 5.
+
 | # | Question | Source passage (gold phrase) | Printed page |
 |---|---|---|---|
 | 1 | What are the four functions that make up the AI RMF Core? | "the Core is composed of four functions: GOVERN, MAP, MEASURE, and MANAGE" | 20 |
@@ -99,23 +101,57 @@ The base model almost never produced the exact schema (0% exact match; titles on
 | 14 | What does a Target Profile describe? | "A Target Profile indicates the outcomes needed to achieve the desired or target AI risk management goals" | 33 |
 | 15 | Which GOVERN subcategory requires keeping a list of AI systems? | "Mechanisms are in place to inventory AI systems and are resourced according to organizational risk priorities" | 23 |
 
-## Retrieval accuracy
+## Retrieval accuracy (`task2-rag/results/task2_results.csv`)
 
-_Fill these in from the notebook output (section 4)._
+15 questions, so one question equals 6.7 percentage points. A hit means a top-k chunk contains the gold phrase as an exact string (after lower-casing and stripping punctuation). This is strict: the failure analysis below shows it undercounts, so these figures are lower bounds. "Rerank" means hybrid (BM25 + dense) retrieves the top 20 candidates, then the cross-encoder `ms-marco-MiniLM-L-6-v2` re-orders them.
 
 | Chunk size | Method | recall@1 | recall@3 | recall@5 |
 |---|---|---|---|---|
-| 100 words | dense | | | |
-| 300 words | dense | | | |
-| 100 words | hybrid (BM25 + dense) | | | |
-| 300 words | hybrid (BM25 + dense) | | | |
+| 100 words | dense | 0.333 | 0.533 | 0.600 |
+| 100 words | BM25 only | 0.333 | 0.467 | 0.467 |
+| 100 words | hybrid (BM25 + dense) | 0.333 | 0.467 | 0.600 |
+| 100 words | hybrid + re-ranker | 0.467 | 0.467 | 0.533 |
+| 300 words | dense | 0.267 | 0.533 | 0.600 |
+| 300 words | BM25 only | 0.333 | 0.533 | 0.533 |
+| 300 words | hybrid (BM25 + dense) | 0.333 | 0.533 | 0.667 |
+| 300 words | hybrid + re-ranker | 0.400 | 0.800 | **0.800** |
 
-**Which chunk size worked better and why:** _(state which won on these numbers. Typical reasoning: larger chunks contain the answer more often, so recall rises, but the embedding is a blurrier average of several topics and more tokens go to the LLM; small chunks are precise but can split an answer from its context.)_
+**Which chunk size worked better, and why.** With plain dense search neither size won: recall@5 is 0.600 for both, and 100 words is only slightly better at recall@1 (0.333 vs 0.267). The gap appears once BM25 and the re-ranker are added: 300-word chunks reach 0.667 with hybrid and 0.800 with re-ranking, against 0.600 and 0.533 for 100-word chunks. Likely reasons:
+- A 300-word chunk keeps the surrounding sentences, so the passage that answers a question is more likely to sit in the same chunk as the words the question uses. BM25 and the cross-encoder then have more evidence to match on.
+- 100-word chunks cut paragraphs into pieces, so a re-ranker sees little context and can push a good chunk down (recall@5 fell from 0.600 to 0.533 at 100 words).
+- Caveat: top-5 of 300-word chunks returns about 1,500 words versus about 500 for 100-word chunks, so part of the advantage is simply retrieving more text. Larger chunks cost about 3x more LLM context and have blurrier embeddings (the 0.267 recall@1 for dense at 300 words reflects that). With only 15 questions, a one-question difference is within noise, so I treat the 300-word + re-ranker result as the best configuration here, not as a proven ranking.
+
+Other observations: BM25 alone was worse than dense at 100 words (0.467 vs 0.600), so keywords alone are not enough for paraphrased questions; hybrid was never worse than dense and added one question at 300 words. Even the best setup missed 3 of 15 questions, and dense search alone missed 6 of 15.
 
 ## Two retrieval failures and what would fix them
 
-1. _Question, what was retrieved, why it failed, fix (e.g. keyword-heavy question such as the GOVERN subcategory one -> BM25/hybrid)._
-2. _Question, what was retrieved, why it failed, fix (e.g. paraphrased question -> query rewriting, re-ranker, different chunk size)._
+I ran the failure inspection on the 100-word dense index, which missed 6 of 15 questions at k=5 (recall@5 = 0.600). I examined the first five misses. Two are genuine retrieval failures; the other three turned out to be weaknesses of my evaluation, which is a finding in itself (see after the two cases).
+
+**Failure 1: "Is it a good goal to remove all negative risk from an AI system?"**
+- **Expected:** the sentence in section 1.2.3 saying that attempting to eliminate negative risk entirely can be counterproductive.
+- **Retrieved instead:** the Appendix B list of AI-specific risks (twice) and the opening of section 1 ("Framing Risk").
+- **Why it failed:** (1) a paraphrase gap: the question says "good goal to remove", the passage says "counterproductive to eliminate". (2) In a document that is entirely about AI risk, words like "negative risk" and "AI system" appear in almost every chunk, so embedding similarity is driven by the generic topic and not by the specific claim. (3) At 100 words the key sentence sits among other prioritisation text, which dilutes its embedding.
+- **What would fix it:** a cross-encoder re-ranker, which reads the question and passage together and can tell that "counterproductive" answers "is it a good goal"; query rewriting or HyDE (generating a hypothetical answer and embedding that); and adding each chunk's section title (for example "1.2.3 Risk Prioritization") to the chunk text. I have not verified these fixes on this question.
+
+**Failure 2: "What can an organization do about a high-priority AI risk?"**
+- **Expected:** MANAGE 1.3 in Table 4, which lists the response options: mitigating, transferring, avoiding or accepting.
+- **Retrieved instead:** the risk-prioritisation prose in section 1.2.3 (twice) and the introduction of the MANAGE function, which is next to the table but is not the table row.
+- **Why it failed:** the answer sits in a table cell. PDF extraction flattens the table, so the row text is mixed with neighbouring rows and category headings, and its embedding is diluted. The question's wording ("high-priority", "organization") also matches the prioritisation prose better than the cell, which says "response options".
+- **What would fix it:** structure-aware chunking for the tables (one chunk per subcategory, for example "MANAGE 1.3: ..."), prefixing chunks with their function and category heading, hybrid search (the cell does contain "high priority", so BM25 can help), and rewriting the question to use the document's own terms ("risk response options").
+
+**Misses that were not real retrieval failures.**
+- *"Why might AI systems need maintenance more often than traditional software?"* The top-ranked chunk is exactly the right bullet in Appendix B. It was counted as a miss because PDF extraction left a hyphenated line break ("cor- rective maintenance"), so the exact-string gold match failed.
+- *"How does the document distinguish resilience from security?"* The top results are the correct section 3.3 text (the second chunk even continues "normal function after an unexpected adverse event, security includes re- silience..."). It is most likely the same hyphenation artefact, since the extracted text shows "re- silience".
+- *"What are the four functions that make up the AI RMF Core?"* The Executive Summary also says the framework has four functions (GOVERN, MAP, MEASURE and MANAGE), so the retrieved chunk answers the question correctly, but my gold phrase comes from section 5. A table-of-contents chunk also matched on the keywords "Core", "Govern" and "Map". The gold-phrase metric cannot credit an equivalent passage.
+
+**Consequence and fix for the metric.** Because of these artefacts, the recall numbers above are lower bounds; true dense recall@5 at 100 words is probably around 0.73 or higher. A hyphen-insensitive comparison fixes it, for example comparing with all non-alphanumeric characters removed:
+
+```python
+squash = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+rank = next((r for r, i in enumerate(got, 1) if squash(q["gold"]) in squash(ix.chunks[i]["text"])), None)
+```
+
+Cleaning the text before chunking (joining "word- continuation" line breaks) would also help the embeddings and BM25, not just the metric.
 
 ## In my own words
 
